@@ -1,9 +1,10 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import asyncio
-
+import aiohttp
 from cryptography.fernet import Fernet
+from datetime import datetime, timedelta
 
 # 고정된 키 사용
 key = b'zsS8Jk5lI9ebXn5A7PzZvGR_pBqDh4Uy13Zkq9RvEsg='  # 생성된 키를 그대로 사용
@@ -25,27 +26,24 @@ intents.members = True  # 유저 관련 이벤트 처리 가능하게
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 관리자 ID
 admin_user_id = 1071962941055832166
-
-# 인증 채널 및 역할 ID
-verification_channel_id = 1281985460759171102  # 인증 메시지를 보낼 채널 ID
-verification_role_id = 1281984545079427234  # 부여할 역할 ID
-
-# 유저 정보 저장 (유저 ID를 기준으로 구매 금액 및 보유 금액 설정)
-user_data = {}
-
-# 환영 메시지를 보낼 채널 ID
-welcome_channel_id = 1281486623795707937  # 환영 메시지를 보낼 채널 ID로 변경
+verification_channel_id = 1281985460759171102
+verification_role_id = 1281984545079427234
+welcome_channel_id = 1281486623795707937
 test_channel_id = 1281599070800187416
 admin_channel_id = 1281906818116751370
-log_channel_id = 1283739021746638930  # 로그 채널
+log_channel_id = 1283739021746638930
+command_channel_id = 1282263120277934161
+trade_channel_id = 1288081638349082695
+chat_channel_id = 1282258321222402070
 
-# 제품 및 재고 정보
+user_data = {}
+trade_timers = {}
+active_trade_channels = {}
 product_data = {
     "유튜브 프리미엄": {
-        "유튜브 프리미엄 6개월": {"price": 15000, "stock": 10},
-        "유튜브 프리미엄 12개월": {"price": 25000, "stock": 10},
+        "유튜브 프리미엄 6개월": {"price": 15000, "stock": -1},
+        "유튜브 프리미엄 12개월": {"price": 25000, "stock": -1},
     },
     "디스코드 니트로": {
         "디스코드 니트로 12개월 ": {"price": 25000, "stock": 0},
@@ -55,15 +53,19 @@ product_data = {
     },
     "스포티파이": {
         "스포티파이 무제한": {"price": 3000, "stock": 0},
+    },
+    "페이팔": {
+        "페이팔 1달러": {"price": 0, "stock": -1}
     }
-}   
-
-# 사용자가 열고 있는 문의, 충전, 구매 채널을 저장 (사용자 ID를 기준으로)
-active_channels = {
-    "inquiry": {},  # 문의 채널
-    "charge": {},   # 충전 채널
-    "purchase": {}  # 구매 채널
 }
+
+active_channels = {
+    "inquiry": {},  
+    "charge": {},   
+    "purchase": {}  
+}
+
+user_trades = {}
 
 def get_user_grade(purchase_amount):
     if purchase_amount >= 1000000:
@@ -78,7 +80,7 @@ def get_user_grade(purchase_amount):
         return "level 2"
     else:
         return "level 1 (일반 등급)"
-    
+
 async def log_data_periodically():
     while True:
         # 1분마다 로그 채널에 데이터 출력
@@ -103,6 +105,371 @@ async def log_data_periodically():
             embed.set_footer(text="주기적인 데이터 출력")
 
             await log_channel.send(embed=embed)
+
+def calculate_time_remaining(user_id):
+    if user_id in trade_timers:
+        start_time = trade_timers[user_id]
+        elapsed_time = datetime.now() - start_time
+        remaining_time = timedelta(seconds=12) - elapsed_time
+        return remaining_time if remaining_time.total_seconds() > 0 else None
+    return None
+
+async def add_trade_action_button(interaction, title, content):
+    user = interaction.user
+    guild = interaction.guild
+
+    # 거래 등록 후, 거래하기 버튼 포함한 메시지 전송
+    await send_trade_embed(guild=guild, user=user, title=title, content=content, include_trade_button=True)
+
+# 거래 등록을 위한 Modal (양식창)
+class TradeModal(discord.ui.Modal):
+    def __init__(self, user_id, title="거래 제목", content="거래 내용"):
+        super().__init__(title="거래 등록/수정")
+        self.user_id = user_id
+        self.title_input = discord.ui.TextInput(label="제목", default=title, required=True)
+        self.content_input = discord.ui.TextInput(label="내용", style=discord.TextStyle.long, default=content, required=True)
+        self.add_item(self.title_input)
+        self.add_item(self.content_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # 유저가 이미 거래를 등록한 경우 수정
+        user_trade = user_trades.get(self.user_id)
+        if user_trade:
+            user_trade["title"] = self.title_input.value
+            user_trade["content"] = self.content_input.value
+            user_trade["updated"] = True  # 수정되었다는 표시
+        else:
+            user_trades[self.user_id] = {
+                "title": self.title_input.value,
+                "content": self.content_input.value,
+                "updated": False  # 처음 등록한 거래는 수정되지 않았음
+            }
+
+        # 등록 후 거래하기 버튼이 포함된 메시지를 전송
+        await add_trade_action_button(interaction, self.title_input.value, self.content_input.value)
+        await interaction.response.send_message("거래가 성공적으로 등록/수정되었습니다.", ephemeral=True)
+
+        # 12시간 후에 업데이트된 거래 메시지를 보내는 작업 시작
+        await schedule_trade_update(self.user_id, interaction)
+
+class TradeRegisterView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    # 거래 등록 버튼
+    @discord.ui.button(label="거래등록", style=discord.ButtonStyle.primary)
+    async def register_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        if user_id in user_trades:
+            await interaction.response.send_message(
+                "이미 등록된 거래가 있습니다. 거래를 수정하거나 삭제하시겠습니까?",
+                view=TradeConfirmView(user_id),
+                ephemeral=True
+            )
+        else:
+            remaining_time = calculate_time_remaining(user_id)
+            if remaining_time:
+                remaining_minutes = remaining_time.seconds // 1
+                await interaction.response.send_message(
+                    f"새로운 거래를 등록하려면 {remaining_minutes}분 후에 다시 시도하세요.",
+                    ephemeral=True
+                )
+            else:
+                modal = TradeModal(user_id)
+                await interaction.response.send_modal(modal)
+                trade_timers[user_id] = datetime.now()
+                await schedule_trade_update(user_id, interaction)
+
+# 거래 참여 기능이 추가된 TradeRegisterAndActionView 클래스
+class TradeRegisterAndActionView(discord.ui.View):
+    def __init__(self, owner_id):
+        super().__init__(timeout=None)
+        self.owner_id = owner_id
+
+    # 거래 등록 버튼
+    @discord.ui.button(label="거래등록", style=discord.ButtonStyle.primary)
+    async def register_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        if user_id in user_trades:
+            await interaction.response.send_message(
+                "이미 등록된 거래가 있습니다. 거래를 수정하거나 삭제하시겠습니까?",
+                view=TradeConfirmView(user_id),
+                ephemeral=True
+            )
+        else:
+            remaining_time = calculate_time_remaining(user_id)
+            if remaining_time:
+                remaining_minutes = remaining_time.seconds // 60
+                await interaction.response.send_message(
+                    f"새로운 거래를 등록하려면 {remaining_minutes}분 후에 다시 시도하세요.",
+                    ephemeral=True
+                )
+            else:
+                modal = TradeModal(user_id)
+                await interaction.response.send_modal(modal)
+                trade_timers[user_id] = datetime.now()
+                await schedule_trade_update(user_id, interaction)
+
+    # 거래하기 버튼
+    @discord.ui.button(label="거래하기", style=discord.ButtonStyle.success)
+    async def start_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        buyer = interaction.user
+        owner_channel = active_trade_channels.get(self.owner_id)
+
+        # 사용자가 자신이 연 거래에 참여하려고 할 경우
+        if buyer.id == self.owner_id:
+            await interaction.response.send_message("자신이 연 거래에 참여할 수 없습니다.", ephemeral=True)
+            return
+
+        # 사용자가 이미 접근 권한을 가지고 있는지 확인
+        if owner_channel and owner_channel.permissions_for(buyer).read_messages:
+            await interaction.response.send_message("이미 이 거래에 참여하고 있습니다.", ephemeral=True)
+            return
+
+        # 거래 채널이 열려있는 경우
+        if owner_channel:
+            # 새로운 사용자에게 채널 접근 권한 부여
+            await owner_channel.set_permissions(buyer, read_messages=True, send_messages=True)
+
+            # 채널에 참여자가 추가되었다고 알림 메시지 전송
+            await owner_channel.send(f"{buyer.display_name}님이 이 거래에 참여하셨습니다!")
+            
+            # 사용자에게 거래 채널에 접근 권한이 부여되었음을 알림
+            await interaction.response.send_message(f"거래 채널에 참여하셨습니다: {owner_channel.mention}", ephemeral=True)
+        else:
+            # 거래 채널이 열려있지 않은 경우 새로 생성
+            await create_trade_channel(interaction.guild, self.owner_id, buyer.id, interaction)
+
+# 거래 수정/삭제 여부를 물어보는 View
+class TradeConfirmView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    @discord.ui.button(label="예", style=discord.ButtonStyle.success)
+    async def confirm_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 기존 거래 수정 양식 띄우기
+        user_trade = user_trades[self.user_id]
+        modal = TradeModal(self.user_id, title=user_trade["title"], content=user_trade["content"])
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="아니오", style=discord.ButtonStyle.danger)
+    async def cancel_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("거래 수정이 취소되었습니다.", ephemeral=True)
+
+    @discord.ui.button(label="삭제", style=discord.ButtonStyle.danger)
+    async def delete_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 거래 삭제 및 메시지 삭제 처리
+        await delete_trade_and_messages(self.user_id, interaction)
+
+# 거래 삭제 및 관련 메시지 삭제 처리
+async def delete_trade_and_messages(user_id, interaction):
+    # 거래 정보 삭제
+    if user_id in user_trades:
+        del user_trades[user_id]
+
+    # 거래 채널에서 해당 유저의 메시지를 모두 삭제
+    trade_channel = bot.get_channel(trade_channel_id)
+    if trade_channel:
+        async for message in trade_channel.history(limit=100):
+            if message.author == bot.user and message.embeds and interaction.user.display_name in message.embeds[0].footer.text:
+                await message.delete()
+
+    await interaction.response.send_message("거래가 삭제되었습니다. 새 거래는 12시간 후에 등록할 수 있습니다.", ephemeral=True)
+
+# 12시간 후에 거래 업데이트를 보내는 함수
+async def schedule_trade_update(user_id, interaction):
+    await asyncio.sleep(12 * 60 * 60)  # 12시간 대기
+    user_trade = user_trades.get(user_id)
+    if user_trade:
+        trade_channel = bot.get_channel(trade_channel_id)
+        if trade_channel:
+            # 12시간 후에 처음과 동일한 형식으로 메시지를 보냄
+            await send_trade_embed(
+                guild=interaction.guild,
+                user=interaction.user,
+                title=user_trade["title"],
+                content=user_trade["content"]
+            )
+
+    # 12시간 타이머가 끝났으므로 기록 삭제
+    if user_id in trade_timers:
+        del trade_timers[user_id]
+
+# 거래를 Embed 형태로 보내는 함수
+async def send_trade_embed(guild, user, title, content, include_trade_button=False):
+    trade_channel = guild.get_channel(trade_channel_id)
+    if trade_channel:
+        embed = discord.Embed(
+            title=f"📦 {title}",  # 유저가 설정한 제목을 사용
+            description=f"**내용:** {content}",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"등록자: {user.display_name}")  # 등록한 유저의 이름이 footer에 표시되도록 설정
+        
+        # 거래등록 버튼만 포함 (처음 메시지에서는 거래하기 버튼 제외)
+        if include_trade_button:
+            view = TradeRegisterAndActionView(user.id)  # 거래등록 + 거래하기 버튼 포함
+        else:
+            view = TradeRegisterView()  # 거래등록 버튼만 포함
+
+        message = await trade_channel.send(embed=embed, view=view)
+        return message.id  # 메시지 ID를 반환하여 나중에 삭제 가능하게 함
+
+# 거래 생성 시 기존 채널에 참여하도록 처리하는 함수
+async def create_trade_channel(guild, owner_id, buyer_id, interaction):
+    # 사용자가 이미 거래 채널을 가지고 있는지 확인
+    if owner_id in active_trade_channels:
+        existing_channel = active_trade_channels[owner_id]
+        await interaction.response.send_message(
+            f"이미 거래 채널이 열려있습니다: {existing_channel.mention}",
+            ephemeral=True
+        )
+        return
+
+    category = discord.utils.get(guild.categories, id=1288081861867733074)
+    if not category:
+        category = await guild.create_category(name="거래", id=1288081861867733074)
+
+    owner = guild.get_member(owner_id)
+    buyer = guild.get_member(buyer_id)
+    admin = guild.get_member(admin_user_id)
+
+    # 채널 생성 시 관리자, 거래 등록자, 거래 버튼을 누른 사람만 볼 수 있도록 권한 설정
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),  # 기본 유저는 접근 불가
+        owner: discord.PermissionOverwrite(read_messages=True),
+        buyer: discord.PermissionOverwrite(read_messages=True),
+        admin: discord.PermissionOverwrite(read_messages=True),
+    }
+
+    # 채널 이름을 거래 등록자와 거래 버튼을 누른 사람의 이름으로 설정
+    channel_name = f"거래-{owner.display_name}-{buyer.display_name}"
+    trade_channel = await category.create_text_channel(name=channel_name, overwrites=overwrites)
+
+    # 거래닫기 버튼을 포함한 View 생성
+    view = TradeCloseView(trade_channel, owner_id)
+
+    # 거래 시작 메시지 (embed로 예쁘게 꾸밈)
+    embed = discord.Embed(
+        title="📦 거래 채널이 생성되었습니다",
+        description=(
+            f"**{owner.display_name}**님과 **{buyer.display_name}**님의 거래가 시작되었습니다.\n"
+            "거래가 완료되면 아래 **거래닫기** 버튼을 눌러주세요."
+        ),
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="관리자가 거래를 모니터링하고 있습니다.")
+    
+    # 메시지 전송
+    await trade_channel.send(embed=embed, view=view)
+
+    # 사용자에게 거래 채널이 생성되었음을 알림
+    await interaction.response.send_message(f"거래 채널이 생성되었습니다: {trade_channel.mention}", ephemeral=True)
+
+    # 사용자별 활성 거래 채널 추적
+    active_trade_channels[owner_id] = trade_channel
+
+# 거래닫기 버튼 View
+# 거래닫기 버튼 View
+# 거래닫기 + 송금 버튼이 포함된 View
+class TradeCloseView(discord.ui.View):
+    def __init__(self, channel, owner_id):
+        super().__init__(timeout=None)
+        self.channel = channel
+        self.owner_id = owner_id
+
+    @discord.ui.button(label="거래닫기", style=discord.ButtonStyle.danger)
+    async def close_trade_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 거래닫기 권한 확인
+        if interaction.user.id == self.owner_id or interaction.user.guild_permissions.administrator:
+            await self.close_channel(interaction)
+        else:
+            await interaction.response.send_message("이 거래를 닫을 권한이 없습니다.", ephemeral=True)
+
+    async def close_channel(self, interaction):
+        overwrites = {self.channel.guild.default_role: discord.PermissionOverwrite(read_messages=False)}
+        await self.channel.edit(overwrites=overwrites, name=f"closed-{self.channel.name}")
+        await self.channel.send("거래가 완료되었습니다. 채널이 곧 삭제됩니다.")
+        await asyncio.sleep(60)
+
+    @discord.ui.button(label="송금", style=discord.ButtonStyle.success)
+    async def transfer_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 채널에 접근 가능한 멤버를 가져옴
+        channel_members = [member for member in self.channel.members if member.id != interaction.user.id]
+        if not channel_members:
+            await interaction.response.send_message("송금할 수 있는 유저가 없습니다.", ephemeral=True)
+            return
+
+        # Select 메뉴로 송금할 유저를 선택하게 함
+        select_view = discord.ui.View()
+        select_view.add_item(TransferSelect(interaction.user.id, channel_members, self.channel))
+        await interaction.response.send_message("송금할 유저를 선택하세요.", view=select_view, ephemeral=True)
+
+# 송금 금액 입력을 위한 Modal
+class TransferAmountModal(discord.ui.Modal):
+    def __init__(self, sender_id, receiver, channel):
+        super().__init__(title="송금 금액 설정")
+        self.sender_id = sender_id
+        self.receiver = receiver
+        self.channel = channel
+
+        # 송금 금액 입력 필드 추가
+        self.amount_input = discord.ui.TextInput(label="송금할 금액", placeholder="송금할 금액을 입력하세요", required=True)
+        self.add_item(self.amount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount = int(self.amount_input.value)
+            if amount <= 0:
+                await interaction.response.send_message("송금 금액은 0보다 커야 합니다.", ephemeral=True)
+                return
+
+            sender_data = user_data.get(self.sender_id)
+            receiver_data = user_data.get(self.receiver.id)
+
+            # 송금할 유저의 보유 금액이 충분한지 확인
+            if sender_data["보유금액"] < amount:
+                await interaction.response.send_message("보유 금액이 부족합니다.", ephemeral=True)
+                return
+
+            # 송금 처리
+            sender_data["보유금액"] -= amount
+            receiver_data["보유금액"] += amount
+
+            # Embed를 사용해 송금 완료 메시지 꾸미기
+            embed = discord.Embed(
+                title="💸 송금 완료",
+                description=f"**{interaction.user.display_name}**님이 **{self.receiver.display_name}**님에게\n`{amount:,}원`을 송금했습니다!",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text="송금이 성공적으로 처리되었습니다.")
+            embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/972493227473121393/1289526425170477161/01_transfer_02.png?ex=66f92492&is=66f7d312&hm=b986460a0c4a6a5ebbb981c6731ec4c832cf8f31f1a92f3e8d27172ae4675a5b&")  # 송금 이미지를 추가할 수 있음
+
+            # 채널에 송금 완료 메시지 전송
+            await self.channel.send(embed=embed)
+
+            # 송금한 유저에게 송금 성공 메시지 전송
+            await interaction.response.send_message(f"{self.receiver.display_name}님에게 {amount:,}원을 송금했습니다.", ephemeral=True)
+
+        except ValueError:
+            await interaction.response.send_message("유효한 금액을 입력하세요.", ephemeral=True)
+
+# 송금할 유저를 선택하는 Select 메뉴
+class TransferSelect(discord.ui.Select):
+    def __init__(self, sender_id, members, channel):
+        self.sender_id = sender_id
+        self.channel = channel
+        options = [discord.SelectOption(label=member.display_name, value=str(member.id)) for member in members]
+        super().__init__(placeholder="송금할 유저를 선택하세요", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_user_id = int(self.values[0])
+        receiver = interaction.guild.get_member(selected_user_id)
+
+        # 송금 금액을 입력받는 Modal 띄우기
+        modal = TransferAmountModal(self.sender_id, receiver, self.channel)
+        await interaction.response.send_modal(modal)
 
 # 문의 채널 생성 및 로그 남기기
 async def create_support_channel(interaction: discord.Interaction):
@@ -392,11 +759,81 @@ async def delete_existing_messages(channel):
     async for message in channel.history(limit=None):
         await message.delete()
 
+# 환율을 주기적으로 업데이트하고 가격을 반영하는 함수
+async def update_paypal_price_periodically():
+    global current_exchange_rate
+    while True:
+        current_exchange_rate = await get_usd_to_krw_rate()  # 현재 환율 가져오기
+        # 페이팔 가격 업데이트
+        product_data["페이팔"]["페이팔 1달러"]["price"] = int(current_exchange_rate * 1.1)  # 수수료 포함 가격
+        await asyncio.sleep(600)  # 10분 대기
+
+gif_url = "https://cdn.discordapp.com/attachments/1077638556832505977/1078726107337080962/-.gif?ex=66dddaf9&is=66dc8979&hm=1b092dbbd7cdcb991f008c274d50241ac92f337ee91625f2a9d3ba757be90a55&"
+
+# 규칙 메시지를 Embed로 전송하는 함수
+async def send_rules_embed():
+    embed = discord.Embed(
+        title="📜 서버 규칙",
+        description=(
+            "1. 모든 유저를 존중해주세요.\n"
+            "2. 비속어나 혐오 표현을 금지합니다.\n"
+            "3. 스팸이나 광고는 허용되지 않습니다.\n"
+            "4. 규칙 위반 시 제재를 받을 수 있습니다."
+        ),
+        color=discord.Color.blue()
+    )
+    embed.set_image(url=gif_url)
+    embed.set_footer(text="규칙을 준수해주세요!")
+
+    channel = bot.get_channel(chat_channel_id)
+    if channel:
+        await channel.send(embed=embed)
+
+# 30초마다 규칙을 전송하는 반복 작업
+@tasks.loop(seconds=300)
+async def periodic_rules_message():
+    await send_rules_embed()
+
 # 봇이 준비되었을 때 실행되는 이벤트
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}!')
+    await bot.tree.sync()
     bot.loop.create_task(log_data_periodically())
+    bot.loop.create_task(update_paypal_price_periodically())
+    periodic_rules_message.start()
+
+    trade_channel = bot.get_channel(trade_channel_id)
+    if trade_channel:
+        embed = discord.Embed(
+            title="📢 거래 등록 안내",
+            description=(
+                "거래상품을 등록하려면 아래 **거래등록** 버튼을 눌러주세요.\n"
+                "12시간마다 거래가 자동으로 갱신됩니다."
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="거래를 등록하고 관리하세요.")
+        await trade_channel.send(embed=embed, view=TradeRegisterView())  # 거래등록 버튼만 포함되도록 설정
+    else:
+        print("거래 채널을 찾을 수 없습니다.")
+
+    command_channel = bot.get_channel(command_channel_id)
+
+    # 채널에 있는 기존 메시지 삭제
+    if command_channel:
+        await delete_existing_messages(command_channel)
+
+        # 사용할 수 있는 커맨드 나열
+        embed = discord.Embed(
+            title="🛠️ 사용 가능한 커맨드",
+            description="아래의 커맨드를 사용해보세요!",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="/페이팔환율", value="페이팔 환율, 수수료를 계산합니다.", inline=False)
+
+        # 메시지 전송
+        await command_channel.send(embed=embed)
 
     guild = bot.guilds[0]  # 봇이 연결된 첫 번째 서버를 선택
     for member in guild.members:
@@ -512,7 +949,7 @@ class ProductSelect(discord.ui.Select):
     def __init__(self, category):
         self.category = category
         options = [
-            discord.SelectOption(label=product_name, description=f"가격: {info['price']}원, 재고: {info['stock']}개")
+            discord.SelectOption(label=product_name, description=f"가격: {info['price']}원, 재고: {info['stock']}개" if info['stock'] >= 0 else f"가격: {info['price']}원, 재고: 무제한")
             for product_name, info in product_data[category].items()
         ]
         super().__init__(placeholder="구매할 제품을 선택하세요", options=options)
@@ -544,8 +981,10 @@ class ProductSelect(discord.ui.Select):
                 total_price = product_info["price"] * quantity
                 if user_data[interaction.user.id]["보유금액"] < total_price:
                     await interaction.response.send_message("보유 금액이 부족합니다.", ephemeral=True)
-                elif product_info["stock"] < quantity:
+                elif product_info["stock"] != -1 and product_info["stock"] < quantity:
                     await interaction.response.send_message("재고가 부족합니다.", ephemeral=True)
+                elif quantity <= 0:
+                    await interaction.response.send_message("1 이상의 수량을 입력하세요.", ephemeral=True)
                 else:
                     # 구매 완료 후 새로운 채널 생성
                     await create_purchase_channel(interaction.user, self.category, self.product, quantity)
@@ -555,6 +994,7 @@ class ProductSelect(discord.ui.Select):
         modal = PurchaseQuantityForm(self.category, selected_product)
         await interaction.response.send_modal(modal)
 
+# 상품 선택 시 재고 처리
 async def create_purchase_channel(user, category, product_name, quantity):
     guild = user.guild
     category_channel = discord.utils.get(guild.categories, name="Purchase")
@@ -588,6 +1028,12 @@ async def create_purchase_channel(user, category, product_name, quantity):
     )
     embed.set_footer(text="문의 채널을 닫으려면 '문의종료' 버튼을 눌러주세요. 구매 완료는 관리자만 가능합니다.")
 
+    # 재고 업데이트: -1은 무한대로 표시
+    if product_data[category][product_name]["stock"] > 0:
+        product_data[category][product_name]["stock"] -= quantity  # 재고가 -1이 아닐 때만 차감
+    else:
+        product_data[category][product_name]["stock"] = -1
+
     # 관리자 호출 멘션
     view = PurchaseCloseView(new_channel, user.id, category, product_name, quantity)
     await new_channel.send(content=f"<@&1281612006205554770>", embed=embed, view=view)
@@ -600,6 +1046,7 @@ async def create_purchase_channel(user, category, product_name, quantity):
             color=discord.Color.green()
         )
         await log_channel.send(embed=log_embed)
+
 class PurchaseCloseView(discord.ui.View):
     def __init__(self, channel, user_id, category, product_name, quantity):
         super().__init__(timeout=None)
@@ -781,7 +1228,10 @@ class TestView(discord.ui.View):
         embed = discord.Embed(title="제품 목록", color=discord.Color.gold())
 
         for category, products in product_data.items():
-            product_list = "\n".join([f"**{name}** - 가격: {info['price']}원 | 재고: {info['stock']}개" for name, info in products.items()])
+            product_list = "\n".join([
+                f"**{name}** - 가격: {info['price']}원 | 재고: {'무한' if info['stock'] <= -1 else info['stock']}개"
+                for name, info in products.items()
+            ])
             embed.add_field(name=f"📦 {category}", value=product_list, inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -806,6 +1256,7 @@ class AdminView(discord.ui.View):
         placeholder="관리자 기능을 선택하세요",
         options=[
             discord.SelectOption(label="✔보유금액 설정", description="유저의 보유 금액을 설정합니다.", value="fill"),
+            discord.SelectOption(label="🔍유저 데이터 보기", description="전체 유저 또는 특정 유저의 데이터를 확인합니다.", value="view_user_data"),
             discord.SelectOption(label="💥폭파", description="채널의 모든 메시지를 삭제합니다.", value="explode"),
             discord.SelectOption(label="🛡상품관리", description="상품을 설정, 추가, 삭제합니다.", value="manage_product"),
             discord.SelectOption(label="🛡카테고리관리", description="카테고리를 설정, 추가, 삭제합니다.", value="manage_category"),
@@ -817,6 +1268,8 @@ class AdminView(discord.ui.View):
     async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
         if select.values[0] == "fill":
             await self.fill_button_callback(interaction)
+        elif select.values[0] == "view_user_data":
+            await self.view_user_data_callback(interaction)
         elif select.values[0] == "explode":
             await self.explode_button_callback(interaction)
         elif select.values[0] == "manage_product":
@@ -850,6 +1303,65 @@ class AdminView(discord.ui.View):
 
         await interaction.response.send_modal(FillForm())
 
+# 전체 유저 데이터 보기 기능 추가
+    async def view_user_data_callback(self, interaction: discord.Interaction):
+        class UserDataView(discord.ui.View):
+            @discord.ui.button(label="전체유저리스트", style=discord.ButtonStyle.primary)
+            async def all_user_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+                # 모든 유저 데이터를 표시하는 기능
+                all_user_info = ""
+                for user_id in user_data:
+                    user = interaction.guild.get_member(user_id)  # 유저 객체 가져오기
+                    if user:
+                        all_user_info += (
+                            f"유저 ID: {user_id} | 닉네임: {user.display_name}\n"
+                            f"구매 금액: {user_data[user_id]['구매금액']:,}원 | 보유 금액: {user_data[user_id]['보유금액']:,}원\n\n"
+                        )
+                if all_user_info:
+                    embed = discord.Embed(
+                        title="전체 유저 리스트",
+                        description=f"```{all_user_info}```",
+                        color=discord.Color.blue()
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                else:
+                    await interaction.response.send_message("유저 데이터가 없습니다.", ephemeral=True)
+
+            @discord.ui.button(label="특정유저리스트", style=discord.ButtonStyle.secondary)
+            async def specific_user_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+                # 특정 유저 데이터를 표시하는 기능 (양식창으로 유저 ID 입력 받음)
+                class UserIDModal(discord.ui.Modal):
+                    def __init__(self):
+                        super().__init__(title="유저 ID 입력")
+                        self.user_id_input = discord.ui.TextInput(label="유저 ID", required=True)
+                        self.add_item(self.user_id_input)
+
+                    async def on_submit(self, interaction: discord.Interaction):
+                        try:
+                            user_id = int(self.user_id_input.value)
+                            user = interaction.guild.get_member(user_id)  # 유저 객체 가져오기
+                            if user_id in user_data:
+                                user_info = user_data[user_id]
+                                embed = discord.Embed(
+                                    title=f"유저 ID {user_id} 정보",
+                                    description=(
+                                        f"**닉네임:** {user.display_name}\n"
+                                        f"**구매 금액:** {user_info['구매금액']:,}원\n"
+                                        f"**보유 금액:** {user_info['보유금액']:,}원\n"
+                                    ),
+                                    color=discord.Color.green()
+                                )
+                                await interaction.response.send_message(embed=embed, ephemeral=True)
+                            else:
+                                await interaction.response.send_message(f"유저 ID {user_id}를 찾을 수 없습니다.", ephemeral=True)
+                        except ValueError:
+                            await interaction.response.send_message("유효한 유저 ID를 입력하세요.", ephemeral=True)
+
+                await interaction.response.send_modal(UserIDModal())
+
+        view = UserDataView()
+        await interaction.response.send_message("전체 유저 리스트 또는 특정 유저 리스트를 선택하세요.", view=view, ephemeral=True)
+
     # 폭파 기능
     async def explode_button_callback(self, interaction: discord.Interaction):
         class ExplodeChannelSelect(discord.ui.Select):
@@ -859,11 +1371,10 @@ class AdminView(discord.ui.View):
                 super().__init__(placeholder="폭파할 채널을 선택하세요", options=options)
 
             async def callback(self, interaction: discord.Interaction):
-                selected_channel_id = int(self.values[0])
-                channel = interaction.guild.get_channel(selected_channel_id)
+                channel_id = int(self.values[0])
+                channel = interaction.guild.get_channel(channel_id)
                 if channel:
-                    await channel.purge()
-                    await interaction.response.send_message(f"채널의 모든 메시지가 삭제되었습니다.", ephemeral=True)
+                    await channel.purge(limit=None)
 
         view = discord.ui.View()
         view.add_item(ExplodeChannelSelect(interaction.guild))
@@ -907,13 +1418,14 @@ class AdminView(discord.ui.View):
                     async def callback(self, interaction: discord.Interaction):
                         selected_category = self.values[0]
 
+                        # 상품 추가 및 설정에서 재고 처리
                         class ProductAddForm(discord.ui.Modal):
                             def __init__(self, category):
                                 super().__init__(title=f"{category}에 상품 추가")
                                 self.category = category
                                 self.product_name_input = discord.ui.TextInput(label="상품 이름", required=True)
                                 self.price_input = discord.ui.TextInput(label="가격", required=True)
-                                self.stock_input = discord.ui.TextInput(label="재고 수", required=True)
+                                self.stock_input = discord.ui.TextInput(label="재고 수", required=True, placeholder="무한 또는 숫자를 입력하세요")
                                 self.add_item(self.product_name_input)
                                 self.add_item(self.price_input)
                                 self.add_item(self.stock_input)
@@ -921,7 +1433,17 @@ class AdminView(discord.ui.View):
                             async def on_submit(self, interaction: discord.Interaction):
                                 product_name = self.product_name_input.value
                                 price = int(self.price_input.value)
-                                stock = int(self.stock_input.value)
+                                stock_input = self.stock_input.value.strip()
+
+                                # 재고 처리
+                                if stock_input.lower() in ["무한", "inf"]:
+                                    stock = -1  # 무한대는 -1로 처리
+                                else:
+                                    stock = int(stock_input)  # 일반 숫자 처리
+
+                                # 재고가 음수일 경우 -1로 고정
+                                if stock < 0:
+                                    stock = -1
 
                                 product_data[self.category][product_name] = {"price": price, "stock": stock}
                                 await interaction.response.send_message(f"{self.category}에 {product_name}가 추가되었습니다.", ephemeral=True)
@@ -1185,5 +1707,53 @@ class VerificationView(discord.ui.View):
             else:
                 await interaction.response.send_message("이미 인증 역할을 가지고 있습니다.", ephemeral=True)
 
+EXCHANGE_RATE_API_URL = "https://v6.exchangerate-api.com/v6/8db89983bbc75f08391c4229/latest/USD"
+
+async def get_usd_to_krw_rate():
+    url = "https://v6.exchangerate-api.com/v6/8db89983bbc75f08391c4229/latest/USD"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                # 응답 상태 코드 확인
+                if response.status != 200:
+                    raise Exception(f"API 요청 실패: {response.status}")
+
+                data = await response.json()
+                return data['conversion_rates']['KRW']
+    except Exception as e:
+        print(f"오류 발생: {str(e)}")
+        return None  # 오류 발생 시 None 반환
+
+# 환율 커맨드 수정
+@bot.tree.command(name="페이팔환율", description="달러화를 입력해주세요. 원화로 변환, 수수료를 계산해드립니다.")
+async def exchange_rate(ctx: discord.Interaction, 금액: float):
+    # 유효성 검사: amount가 양수인지 확인
+    if 금액 <= 0:
+        await ctx.response.send_message("변환 금액은 0보다 커야 합니다.", ephemeral=True)
+        return
+
+    # 환율 계산
+    rate = await get_usd_to_krw_rate()
+    krw_amount = 금액 * rate
+    bank_transfer = krw_amount * 1.1
+
+    # Embed 메시지 설정
+    embed = discord.Embed(
+        title="💵 페이팔 계산 결과",
+        description=f"**변환 금액 (USD)**: `{금액:.2f} USD`\n\n"
+                    "입력하시면 지불해야 하는 금액이 나옵니다.\n\n"
+                    f"💰 **받으실 금액**: `{krw_amount:,.0f}₩`\n\n"
+                    f"💸 **지불하실 금액**:\n"
+                    f"- 충전금액 (계좌): `{bank_transfer:,.0f}₩`",
+        color=discord.Color.blue()
+    )
+
+    # PayPal 로고 추가
+    embed.set_thumbnail(url="https://www.paypalobjects.com/webstatic/icon/pp258.png")
+    embed.set_footer(text="Made by H1R7")
+
+    # 사용자에게만 보이는 메시지로 전송
+    await ctx.response.send_message(embed=embed, ephemeral=True)
+
 # 봇 실행 (YOUR_BOT_TOKEN을 실제 디스코드 봇 토큰으로 교체)
-bot.run("MTI4NjY1OTAzNzY3NjU3MjcxMw.G3vrch.Xu2kN_5wbYUiyCb0iIoSz39zUvCV0P4KqmbDcg")
+bot.run(DISCORD_TOKEN)
